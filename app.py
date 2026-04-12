@@ -7,18 +7,15 @@ import zipfile
 import re
 import pandas as pd
 import shutil
-import random
+import uuid  # Dodajemy do generowania unikalnych ID
 
-# --- KONFIGURACJA ŚRODOWISKA DLA STREAMLIT CLOUD ---
+# --- KONFIGURACJA ŚRODOWISKA ---
 os.environ["SELENIUMBASE_DRIVER_PATH"] = "/tmp/drivers"
 os.environ["UC_DRIVER_PATH"] = "/tmp/uc_drivers"
 
-# --- FUNKCJA FORMATUJĄCA LICZBY NA POLSKI STANDARD ---
 def formatuj_walute(kwota):
-    # Format: 1 234 567,89 PLN
     return f"{kwota:,.2f}".replace(",", " ").replace(".", ",") + " PLN"
 
-# --- FUNKCJA CZYSZCZĄCA LICZBY Z XML ---
 def wyciagnij_liczbe(raw_html):
     if not raw_html: return 0.0
     clean = re.sub(r'<[^>]+>', '', raw_html)
@@ -32,20 +29,23 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
     nazwa_firmy = None
     executable_path = shutil.which("chromium") or shutil.which("google-chrome")
     
-    katalog = "/tmp/downloads"
-    if os.path.exists(katalog): shutil.rmtree(katalog)
-    os.makedirs(katalog)
+    # KLUCZOWA ZMIANA: Unikalny folder dla KAŻDEGO uruchomienia
+    session_id = str(uuid.uuid4())[:8] # Krótkie ID sesji
+    katalog_sesji = f"/tmp/downloads_{session_id}"
+    
+    if os.path.exists(katalog_sesji): shutil.rmtree(katalog_sesji)
+    os.makedirs(katalog_sesji)
 
     with SB(uc=False, browser="chrome", binary_location=executable_path, headless=True, xvfb=True,
             chromium_arg="--no-sandbox,--disable-dev-shm-usage") as sb:
         try:
-            # Wymuszenie ścieżki pobierania dla Chrome w kontenerze
+            # Wskazujemy Chrome unikalny folder pobierania
             sb.execute_cdp_cmd("Page.setDownloadBehavior", {
                 "behavior": "allow",
-                "downloadPath": katalog
+                "downloadPath": katalog_sesji
             })
 
-            log_callback("🌐 Łączenie z Ministerstwem Sprawiedliwości...")
+            log_callback(f"🌐 Sesja {session_id}: Łączenie z RDF...")
             sb.open("https://rdf-przegladarka.ms.gov.pl/")
             
             sb.type("input[formcontrolname='numerKRS']", krs)
@@ -55,7 +55,6 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
             nazwa_firmy = sb.get_text("div:contains('Nazwa / firma podmiotu') + div")
             log_callback(f"🏢 Firma: {nazwa_firmy}")
 
-            # Filtrowanie rocznych sprawozdań
             sb.click("span.p-button-label:contains('Pokaż filtry')")
             time.sleep(1)
             sb.click("span#rodzajDokumentuNazwaInput")
@@ -65,44 +64,39 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
 
             wiersze = sb.find_elements("tbody tr")
             ile_faktycznie = min(limit_lat, len(wiersze))
-            log_callback(f"🔎 Wykryto {len(wiersze)} pozycji. Pobieram {ile_faktycznie} ostatnie...")
+            log_callback(f"🔎 Pobieram {ile_faktycznie} dokumenty...")
 
             pobrane_zips = []
             for i in range(1, ile_faktycznie + 1):
                 try:
                     btn_row = f"tbody tr:nth-child({i}) button"
-                    log_callback(f"📂 Otwieram wiersz {i}...")
                     sb.click(btn_row)
                     time.sleep(2)
                     
                     btn_download = "button:contains('Pobierz dokumenty')"
                     sb.wait_for_element(btn_download, timeout=10)
                     sb.click(btn_download)
-                    log_callback(f"⏳ Pobieranie pliku ZIP...")
                     
-                    # Czekanie na fizyczne pojawienie się pliku na dysku
                     plik_ok = False
                     for sekunda in range(45):
                         time.sleep(1)
-                        found = glob.glob(os.path.join(katalog, '*.zip'))
-                        # Ignorujemy pliki tymczasowe Chrome (.crdownload)
+                        # Szukamy tylko w folderze tej konkretnej sesji
+                        found = glob.glob(os.path.join(katalog_sesji, '*.zip'))
                         new_files = [f for f in found if f not in pobrane_zips and not f.endswith('.crdownload')]
                         if new_files:
-                            path = os.path.join(katalog, f"data_{i}.zip")
+                            path = os.path.join(katalog_sesji, f"data_{i}.zip")
                             os.rename(new_files[0], path)
                             pobrane_zips.append(path)
-                            log_callback(f"✅ Dokument {i} gotowy.")
+                            log_callback(f"✅ Dokument {i} pobrany.")
                             plik_ok = True
                             break
                     
-                    if not plik_ok: log_callback(f"❌ Przekroczono czas pobierania dla pliku {i}")
-                    
-                    sb.click(btn_row) # Zwiń wiersz
+                    sb.click(btn_row)
                     time.sleep(1)
                 except Exception as e:
-                    log_callback(f"⚠️ Problem z wierszem {i}: {str(e)[:40]}...")
+                    log_callback(f"⚠️ Wiersz {i}: {str(e)[:30]}")
 
-            log_callback(f"🧠 Przeszukiwanie XML w {len(pobrane_zips)} archiwach...")
+            log_callback(f"🧠 Analiza XML...")
             for zp in pobrane_zips:
                 try:
                     with zipfile.ZipFile(zp, 'r') as z:
@@ -114,7 +108,6 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
                                     rok = rok_m.group(1) if rok_m else "????"
                                     
                                     val = 0.0
-                                    # Szukanie kwoty w najczęstszych tagach podatkowych
                                     for tag in ['P_ID_11', 'P_ID_10', 'P_ID_9']:
                                         pattern = rf'<[^>]*?{tag}[^>]*?>(.*?)</[^>]*?{tag}>'
                                         match = re.search(pattern, raw, re.DOTALL)
@@ -122,71 +115,45 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
                                             rb = re.search(r'<[^>]*?RB[^>]*?>(.*?)</[^>]*?RB>', match.group(1), re.DOTALL)
                                             if rb:
                                                 val = wyciagnij_liczbe(rb.group(1))
-                                                log_callback(f"💰 {rok}: Odczytano wartość.")
                                                 break
                                     results.append({"Rok": rok, "Podatek": val})
+                                break 
                 except Exception:
-                    log_callback(f"⚠️ Nie udało się otworzyć jednego z plików ZIP.")
+                    pass
 
             return results, nazwa_firmy
-        except Exception as e:
-            log_callback(f"💥 Błąd krytyczny: {e}")
-            return [], nazwa_firmy
+        finally:
+            # Bardzo ważne: Sprzątamy folder po zakończeniu pracy bota
+            if os.path.exists(katalog_sesji):
+                shutil.rmtree(katalog_sesji)
 
-# --- INTERFEJS UŻYTKOWNIKA STREAMLIT ---
-st.set_page_config(page_title="Scanner Podatkowy KRS", page_icon="📊", layout="wide")
-
+# --- UI ---
+st.set_page_config(page_title="Scanner KRS", page_icon="📊", layout="wide")
 st.title("📊 Analityk Podatkowy KRS")
-st.markdown("Automatyczne pobieranie i analiza pozycji **P_ID_11** z systemu RDF.")
 
 with st.sidebar:
     st.header("⚙️ Ustawienia")
-    krs_val = st.text_input("Numer KRS", max_chars=10, placeholder="Np. 0000032892")
-    lat_val = st.slider("Liczba lat wstecz:", 1, 5, 1)
-    
-    st.divider()
-    start_btn = st.button("Szukaj 🔍", use_container_width=True)
-    if st.button("Reset 🧹", use_container_width=True):
-        st.rerun()
+    krs_val = st.text_input("Numer KRS", max_chars=10)
+    lat_val = st.slider("Liczba lat:", 1, 5, 1)
+    start_btn = st.button("Analizuj 🔍", use_container_width=True)
 
 if start_btn and krs_val:
-    if len(krs_val) == 10 and krs_val.isdigit():
-        with st.status("🕵️ Bot pracuje (może to zająć chwilę)...", expanded=True) as status:
-            log_area = st.empty()
-            log_list = []
-            def my_log(m):
-                log_list.append(m)
-                log_area.code("\n".join(log_list[-5:]))
-            
-            dane, nazwa = wykonaj_analize_krs(krs_val, my_log, lat_val)
-            status.update(label="Analiza zakończona!", state="complete")
+    with st.status("🕵️ Praca bota...", expanded=True) as status:
+        l_area = st.empty()
+        l_list = []
+        def my_log(m):
+            l_list.append(m); l_area.code("\n".join(l_list[-5:]))
+        
+        dane, nazwa = wykonaj_analize_krs(krs_val, my_log, lat_val)
+        status.update(label="Gotowe!", state="complete")
 
-        if nazwa:
-            st.divider()
-            st.header(f"🏢 {nazwa}")
-            
-            if dane:
-                # Przygotowanie danych do tabeli
-                df = pd.DataFrame(dane).sort_values("Rok", ascending=False)
-                
-                # Kopia do wyświetlania z polskim formatowaniem
-                df_view = df.copy()
-                df_view["Podatek"] = df_view["Podatek"].apply(formatuj_walute)
-                
-                col_t, col_m = st.columns([2, 1])
-                
-                with col_t:
-                    st.subheader("Zestawienie roczne")
-                    st.table(df_view)
-                
-                with col_m:
-                    st.subheader("Podsumowanie")
-                    suma_num = df["Podatek"].sum()
-                    st.metric(label=f"Suma z {len(dane)} lat", value=formatuj_walute(suma_num))
-                    st.info("Wartości pochodzą z pola 'Rok Bieżący' (RB) w sekcji podatku dochodowego.")
-            else:
-                st.warning("Pobrano pliki, ale nie znaleziono w nich oczekiwanych danych finansowych.")
+    if nazwa:
+        st.header(f"🏢 {nazwa}")
+        if dane:
+            df = pd.DataFrame(dane).sort_values("Rok", ascending=False)
+            df_view = df.copy()
+            df_view["Podatek"] = df_view["Podatek"].apply(formatuj_walute)
+            st.table(df_view)
+            st.metric("Suma", formatuj_walute(df["Podatek"].sum()))
         else:
-            st.error("Nie udało się pobrać danych. Upewnij się, że numer KRS jest poprawny.")
-    else:
-        st.error("Numer KRS musi składać się z 10 cyfr.")
+            st.warning("Nie znaleziono danych podatkowych.")
