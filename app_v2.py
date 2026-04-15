@@ -28,7 +28,6 @@ def wyciagnij_liczbe(raw_html):
 def wykonaj_analize_krs(krs, log_callback, limit_lat):
     results = []
     nazwa_firmy = None
-    error_msg = None # Tu zapiszemy konkretny błąd techniczny
     
     executable_path = shutil.which("chromium") or shutil.which("google-chrome")
     session_id = str(uuid.uuid4())[:8]
@@ -42,7 +41,7 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
         try:
             sb.execute_cdp_cmd("Page.setDownloadBehavior", {"behavior": "allow", "downloadPath": katalog_sesji})
 
-            log_callback(f"🌐 Łączenie z bazą Ministerstwa...")
+            log_callback(f"🌐 [{session_id}] Łączenie z bazą RDF...")
             sb.open("https://rdf-przegladarka.ms.gov.pl/")
             
             sb.type("input[formcontrolname='numerKRS']", krs)
@@ -50,53 +49,70 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
             sb.wait_for_element("table", timeout=20)
             
             nazwa_firmy = sb.get_text("div:contains('Nazwa / firma podmiotu') + div")
-            log_callback(f"🏢 Firma: {nazwa_firmy}")
+            log_callback(f"🏢 [{session_id}] Podmiot: {nazwa_firmy}")
 
-            # FILTROWANIE - Wzmocniona logika
+            # --- KROK KLUCZOWY: ZMIANA STRONICOWANIA NA 100 WIERSZY ---
             try:
-                sb.click("span.p-button-label:contains('Pokaż filtry')")
+                log_callback(f"📏 [{session_id}] Rozszerzam tabelę do 100 wierszy...")
+                # Klikamy w dropdown wyboru liczby wierszy (na dole po prawej)
+                sb.click("p-dropdown.p-paginator-rpp-options", timeout=5)
+                time.sleep(1)
+                # Wybieramy opcję 100
+                sb.click("li[aria-label='100']", timeout=5)
+                time.sleep(3)
+            except:
+                log_callback(f"⚠️ Nie udało się rozwinąć tabeli do 100, sprawdzam co jest...")
+
+            # Filtrowanie (próbujemy, ale nie polegamy tylko na nim)
+            try:
+                sb.click("span.p-button-label:contains('Pokaż filtry')", timeout=5)
                 time.sleep(1)
                 sb.click("span#rodzajDokumentuNazwaInput")
-                time.sleep(1)
-                # Szukamy elementu listy w sposób bardziej odporny
-                sb.click('li:contains("Roczne sprawozdanie finansowe")', timeout=10)
+                sb.click('li:contains("Roczne sprawozdanie finansowe")', timeout=5)
                 sb.click("button:contains('Filtruj')")
-                time.sleep(5)
-            except Exception as e:
-                error_msg = f"Nie udało się ustawić filtrów na stronie Ministerstwa (Błąd: {str(e)[:50]})"
-                raise Exception(error_msg)
+                time.sleep(4)
+            except:
+                pass
 
+            # Skanujemy tabelę (teraz powinna mieć 100 wierszy na jednej stronie)
             wiersze = sb.find_elements("tbody tr")
-            if not wiersze or "nie znaleziono" in wiersze[0].text.lower():
-                return [], nazwa_firmy, None
+            wiersze_do_pobrania = []
+            
+            for i, w in enumerate(wiersze):
+                tekst = w.text.lower()
+                if "roczne sprawozdanie finansowe" in tekst and "korekta" not in tekst:
+                    wiersze_do_pobrania.append(i + 1)
+                if len(wiersze_do_pobrania) >= limit_lat:
+                    break
 
-            ile_pobrac = min(limit_lat, len(wiersze))
-            log_callback(f"🔎 Analizuję {ile_pobrac} ostatnie dokumenty...")
+            log_callback(f"🔎 [{session_id}] Wykryto {len(wiersze_do_pobrania)} sprawozdań na liście.")
 
             pobrane_zips = []
-            for i in range(1, ile_pobrac + 1):
+            for i, pos in enumerate(wiersze_do_pobrania):
                 try:
-                    btn_row = f"tbody tr:nth-child({i}) button"
+                    btn_row = f"tbody tr:nth-child({pos}) button"
+                    sb.scroll_to(btn_row)
                     sb.click(btn_row)
                     time.sleep(2)
                     sb.click("button:contains('Pobierz dokumenty')")
                     
                     plik_ok = False
-                    for _ in range(40):
+                    for _ in range(45):
                         time.sleep(1)
                         found = glob.glob(os.path.join(katalog_sesji, '*.zip'))
                         new_files = [f for f in found if f not in pobrane_zips and not f.endswith('.crdownload')]
                         if new_files:
-                            path = os.path.join(katalog_sesji, f"file_{i}.zip")
+                            path = os.path.join(katalog_sesji, f"file_{pos}.zip")
                             os.rename(new_files[0], path)
                             pobrane_zips.append(path)
-                            log_callback(f"✅ Dokument {i} pobrany.")
+                            log_callback(f"✅ [{session_id}] Dokument {i+1} pobrany.")
                             plik_ok = True
                             break
-                    sb.click(btn_row) # Zwiń
-                except: continue
+                    sb.click(btn_row)
+                except: 
+                    continue
 
-            log_callback("🧠 Analiza XML...")
+            log_callback(f"🧠 [{session_id}] Analiza XML i detekcja skali...")
             for zp in pobrane_zips:
                 try:
                     with zipfile.ZipFile(zp, 'r') as z:
@@ -104,65 +120,77 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
                             if fname.endswith('.xml'):
                                 with z.open(fname) as fxml:
                                     raw = fxml.read().decode('utf-8', errors='ignore')
+                                    
+                                    # --- PANCERNA DETEKCJA SKALI ---
                                     skala = 1
-                                    zaokr_m = re.search(r'<[^>]*?WielkoscZaokraglen[^>]*?>(.*?)</[^>]*?WielkoscZaokraglen>', raw)
-                                    if zaokr_m and zaokr_m.group(1).strip() == "3": skala = 1000
-                                    elif zaokr_m and zaokr_m.group(1).strip() == "6": skala = 1000000
+                                    zaokr_match = re.search(r'WielkoscZaokraglen[^>]*?>(\d+)<', raw)
+                                    if zaokr_match:
+                                        z_val = zaokr_match.group(1)
+                                        if z_val == "3": skala = 1000
+                                        elif z_val == "6": skala = 1000000
+                                    
+                                    # Fallback: szukamy tekstu o tysiącach w pierwszych 5000 znaków
+                                    if skala == 1 and ("tys. PLN" in raw[:5000] or "tysiącach złotych" in raw[:5000]):
+                                        skala = 1000
 
-                                    rok_m = re.search(r'<[^>]*?DataDo[^>]*?>(\d{4})', raw)
+                                    rok_m = re.search(r'DataDo[^>]*?>(\d{4})', raw)
                                     rok = rok_m.group(1) if rok_m else "????"
                                     
                                     val = 0.0
+                                    found_tag = False
                                     for tag in ['P_ID_11', 'P_ID_10', 'P_ID_9']:
-                                        pattern = rf'<[^>]*?{tag}[^>]*?>(.*?)</[^>]*?{tag}>'
+                                        pattern = rf'<{tag}[^>]*?>(.*?)</{tag}>'
                                         match = re.search(pattern, raw, re.DOTALL)
                                         if match:
-                                            rb_m = re.search(r'<[^>]*?RB[^>]*?>(.*?)</[^>]*?RB>', match.group(1), re.DOTALL)
+                                            rb_m = re.search(r'<RB[^>]*?>(.*?)</RB>', match.group(1), re.DOTALL)
                                             if rb_m:
                                                 val = wyciagnij_liczbe(rb_m.group(1)) * skala
+                                                log_callback(f"💰 [{session_id}] {rok}: Skala x{skala}")
+                                                found_tag = True
                                                 break
-                                    results.append({"Rok": rok, "Podatek": val})
+                                    
+                                    if found_tag:
+                                        results.append({"Rok": rok, "Podatek": val})
                                 break 
                 except: pass
 
             return results, nazwa_firmy, None
 
         except Exception as e:
-            # Zwracamy błąd do UI
-            return None, nazwa_firmy, error_msg or str(e)
+            return None, nazwa_firmy, str(e)
         finally:
             if os.path.exists(katalog_sesji): shutil.rmtree(katalog_sesji)
 
-# --- UI ---
+# --- UI STREAMLIT ---
 st.set_page_config(page_title="Scanner Podatkowy KRS", page_icon="📊", layout="wide")
 st.title("📊 Analityk Podatkowy KRS")
 
 with st.sidebar:
     st.header("⚙️ Ustawienia")
-    krs_val = st.text_input("Numer KRS", max_chars=10)
-    lat_val = st.slider("Liczba lat:", 1, 5, 1)
-    start_btn = st.button("Szukaj 🔍", use_container_width=True)
+    krs_val = st.text_input("Numer KRS", max_chars=10, placeholder="Np. 0000032892")
+    lat_val = st.slider("Liczba lat:", 1, 5, 5)
+    st.divider()
+    start_btn = st.button("Analizuj 🔍", use_container_width=True)
 
 if start_btn and krs_val:
-    with st.status("🕵️ Praca bota...", expanded=True) as status:
+    with st.status("🕵️ Bot pracuje...", expanded=True) as status:
         log_area = st.empty()
         log_list = []
         def my_log(m):
             log_list.append(m); log_area.code("\n".join(log_list[-5:]))
         
-        wyniki, firma, blad_techniczny = wykonaj_analize_krs(krs_val, my_log, lat_val)
-        status.update(label="Gotowe!", state="complete")
+        wyniki, firma, blad = wykonaj_analize_krs(krs_val, my_log, lat_val)
+        status.update(label="Analiza zakończona!", state="complete")
 
-    if blad_techniczny:
-        st.error(f"❌ Wystąpił błąd techniczny: {blad_techniczny}")
-        st.info("💡 Spróbuj uruchomić analizę ponownie. Czasami serwery Ministerstwa wymagają odświeżenia.")
+    if blad:
+        st.error(f"❌ Błąd: {blad}")
     elif firma:
         st.header(f"🏢 {firma}")
         if wyniki:
-            df = pd.DataFrame(wyniki).sort_values("Rok", ascending=False)
+            df = pd.DataFrame(wyniki).sort_values("Rok", ascending=False).drop_duplicates("Rok")
             df_disp = df.copy()
             df_disp["Podatek"] = df_disp["Podatek"].apply(formatuj_walute)
             st.table(df_disp)
             st.metric("Suma podatku", formatuj_walute(df["Podatek"].sum()))
         else:
-            st.warning("⚠️ Brak dokumentów typu 'Roczne sprawozdanie finansowe' lub brak tagów finansowych w plikach.")
+            st.warning("⚠️ Nie znaleziono właściwych plików XML (P_ID_11).")
