@@ -44,46 +44,65 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
             log_callback(f"🌐 [{session_id}] Łączenie z RDF...")
             sb.open("https://rdf-przegladarka.ms.gov.pl/")
             
-            # --- SPRAWDZANIE BŁĘDÓW STRONY NA START ---
-            if sb.is_text_visible("Wystąpił nieoczekiwany błąd") or sb.is_text_visible("Przerwa techniczna"):
-                return None, None, "Strona Ministerstwa zgłasza błąd systemowy. Spróbuj za chwilę."
-
+            # Wpisanie KRS i próba wyszukania
             sb.type("input[formcontrolname='numerKRS']", krs)
-            sb.click("span.p-button-label:contains('Wyszukaj')")
+            time.sleep(1)
+            sb.click("button[type='submit']") # Klikamy bezpośrednio w button zamiast w span
             
-            # Czekamy na tabelę, ale sprawdzamy czy nie wyskoczył błąd
-            for _ in range(10):
-                if sb.is_element_visible("table"): break
-                if sb.is_text_visible("Wystąpił błąd"):
-                    return None, None, "Błąd wyszukiwania po stronie Ministerstwa (Toast Error)."
+            log_callback(f"⏳ [{session_id}] Oczekiwanie na odpowiedź serwera...")
+            
+            # --- KROK 1: SPRAWDZAMY CZY PODMIOT ISTNIEJE ---
+            found = False
+            for _ in range(15): # Czekamy max 15 sekund
+                if sb.is_text_visible("Nie znaleziono podmiotu", timeout=1):
+                    return None, None, "Podany numer KRS nie figuruje w bazie RDF."
+                if sb.is_element_visible("table"):
+                    found = True
+                    break
                 time.sleep(1)
+            
+            if not found:
+                return None, None, "Serwer Ministerstwa nie zwrócił wyników (Timeout). Spróbuj ponownie."
 
-            nazwa_firmy = sb.get_text("div:contains('Nazwa / firma podmiotu') + div")
+            # --- KROK 2: POBIERANIE NAZWY (ODPORNIEJSZE) ---
+            try:
+                # Szukamy nazwy w kontenerze szczegółów
+                nazwa_firmy = sb.get_text("div.p-grid div:nth-child(2)").split('\n')[1]
+            except:
+                try:
+                    nazwa_firmy = sb.get_text("div:contains('Nazwa / firma podmiotu') + div")
+                except:
+                    nazwa_firmy = f"Podmiot KRS {krs}"
+            
             log_callback(f"🏢 [{session_id}] Firma: {nazwa_firmy}")
 
-            # --- BEZPIECZNE ROZSZERZANIE TABELI (JS) ---
+            # --- KROK 3: ROZSZERZANIE TABELI ---
             try:
-                log_callback(f"📏 [{session_id}] Próba wymuszenia 100 wierszy...")
-                sb.execute_script("document.querySelector('p-dropdown').click()") # Otwórz menu
+                sb.execute_script("document.querySelector('p-dropdown').click()")
                 time.sleep(1)
-                sb.execute_script("document.querySelectorAll('p-dropdownitem li')[2].click()") # Wybierz 100
+                sb.click("li[aria-label='100']")
                 time.sleep(3)
-            except:
-                log_callback(f"⚠️ Nie udało się zmienić widoku na 100. Próbuję pracować na domyślnym.")
+            except: pass
 
-            # Skanowanie wierszy
+            # Filtrowanie
+            try:
+                sb.click("span.p-button-label:contains('Pokaż filtry')", timeout=5)
+                sb.click("span#rodzajDokumentuNazwaInput")
+                sb.click('li:contains("Roczne sprawozdanie finansowe")')
+                sb.click("button:contains('Filtruj')")
+                time.sleep(4)
+            except: pass
+
+            # Skanowanie i pobieranie
             wiersze = sb.find_elements("tbody tr")
             wiersze_do_pobrania = []
             for i, w in enumerate(wiersze):
-                t = w.text.lower()
-                if "roczne sprawozdanie finansowe" in t and "korekta" not in t:
+                if "roczne sprawozdanie finansowe" in w.text.lower():
                     wiersze_do_pobrania.append(i + 1)
                 if len(wiersze_do_pobrania) >= limit_lat: break
 
             if not wiersze_do_pobrania:
-                return [], nazwa_firmy, "Nie znaleziono dokumentów finansowych na liście."
-
-            log_callback(f"🔎 [{session_id}] Znaleziono {len(wiersze_do_pobrania)} plików. Start pobierania...")
+                return [], nazwa_firmy, None
 
             pobrane_zips = []
             for i, pos in enumerate(wiersze_do_pobrania):
@@ -92,39 +111,23 @@ def wykonaj_analize_krs(krs, log_callback, limit_lat):
                     sb.scroll_to(btn_row)
                     sb.click(btn_row)
                     time.sleep(2)
-                    
-                    # Sprawdzamy czy przycisk pobierania w ogóle jest
-                    if not sb.is_element_visible("button:contains('Pobierz dokumenty')"):
-                        log_callback(f"❌ [{session_id}] Brak przycisku pobierania w wierszu {pos}")
-                        continue
-
                     sb.click("button:contains('Pobierz dokumenty')")
                     
-                    # Weryfikacja pobrania
-                    plik_ok = False
-                    for _ in range(30):
+                    for _ in range(40):
                         time.sleep(1)
-                        found = glob.glob(os.path.join(katalog_sesji, '*.zip'))
-                        new_files = [f for f in found if f not in pobrane_zips and not f.endswith('.crdownload')]
+                        found_files = glob.glob(os.path.join(katalog_sesji, '*.zip'))
+                        new_files = [f for f in found_files if f not in pobrane_zips and not f.endswith('.crdownload')]
                         if new_files:
                             path = os.path.join(katalog_sesji, f"file_{pos}.zip")
                             os.rename(new_files[0], path)
                             pobrane_zips.append(path)
-                            log_callback(f"✅ [{session_id}] Dokument {i+1} pobrany pomyślnie.")
-                            plik_ok = True
+                            log_callback(f"✅ [{session_id}] Dokument {i+1} pobrany.")
                             break
-                    
-                    if not plik_ok:
-                        log_callback(f"⚠️ [{session_id}] Dokument {i+1} nie pobrał się (timeout).")
-                    
-                    sb.click(btn_row) # Zwiń
-                except Exception as e:
-                    log_callback(f"⚠️ Błąd w wierszu {pos}: {str(e)[:40]}")
+                    sb.click(btn_row)
+                except: continue
 
-            if not pobrane_zips:
-                return [], nazwa_firmy, "Wykryto pliki, ale żaden nie został pomyślnie pobrany z serwera."
-
-            log_callback(f"🧠 [{session_id}] Analiza XML...")
+            # Analiza plików
+            log_callback(f"🧠 [{session_id}] Analiza plików...")
             for zp in pobrane_zips:
                 try:
                     with zipfile.ZipFile(zp, 'r') as z:
@@ -192,4 +195,4 @@ if start_btn and krs_val:
             st.table(df_disp)
             st.metric("Suma podatku", formatuj_walute(df["Podatek"].sum()))
         else:
-            st.warning("⚠️ Na liście są dokumenty, ale nie udało się pobrać z nich danych finansowych.")
+            st.warning("⚠️ Nie znaleziono sprawozdań finansowych spełniających kryteria.")
